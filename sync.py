@@ -146,6 +146,8 @@ DEFAULT_CONFIG = {
     "debounce_seconds": 5,
     "pull_interval_seconds": 1800,      # probation: 30 min
     "graduated_pull_interval": 120,     # graduated: 2 min
+    "graduation_hours": 24,             # graduate after 24 cumulative healthy online hours
+    "quiet_hours": {"start": 23, "end": 5},  # pause scheduled pulls from 23:00 to 05:00
     "commit_message_prefix": "auto-sync",
     "ignore_patterns": [
         ".git", ".venv", "__pycache__", "*.pyc",
@@ -277,6 +279,7 @@ class AutoSync:
                 warning_file.unlink()
             except OSError:
                 pass
+        _record_healthy_tick(self.repo.path)
 
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger(f"autosync-{self.repo.path.name}")
@@ -310,6 +313,24 @@ class AutoSync:
         except Exception:
             pass
         return self.config["pull_interval_seconds"]
+
+    def _is_quiet_hours(self) -> bool:
+        quiet = self.config.get("quiet_hours", {})
+        start = int(quiet.get("start", 23))
+        end = int(quiet.get("end", 5))
+        hour = datetime.now().hour
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def _seconds_until_active(self) -> int:
+        quiet = self.config.get("quiet_hours", {})
+        end = int(quiet.get("end", 5))
+        now = datetime.now()
+        target = now.replace(hour=end, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        return max(60, int((target - now).total_seconds()))
 
     def _on_file_change(self):
         self._last_change_time = time.time()
@@ -354,8 +375,13 @@ class AutoSync:
 
     def _pull_loop(self):
         while self._running:
+            if self._is_quiet_hours():
+                time.sleep(min(self._seconds_until_active(), 300))
+                continue
             interval = self._get_pull_interval()
             time.sleep(interval)
+            if self._is_quiet_hours():
+                continue
             with self._lock:
                 try:
                     ok, desc = self.repo.pull()
@@ -413,14 +439,16 @@ class AutoSync:
         # Initial sync
         try:
             with self._lock:
-                self.repo.pull()
+                pulled, pull_desc = self.repo.pull()
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
                 ok, desc = self.repo.commit_and_push(f"{self.config['commit_message_prefix']}: {stamp}")
                 if ok:
                     self.logger.info(f"↑ startup push: {desc}")
                     self._mark_success(desc)
+                elif pulled or pull_desc == "up to date":
+                    self._mark_success(pull_desc)
                 else:
-                    self._mark_success("startup check completed")
+                    self.logger.warning(f"⚠ startup pull failed: {pull_desc}")
         except Exception as e:
             self.logger.warning(f"⚠ startup sync failed: {e}")
 
@@ -448,7 +476,7 @@ class AutoSync:
 #  Health check + Graduation
 # ══════════════════════════════════════════════════════
 
-GRADUATION_DAYS = 5
+GRADUATION_HOURS = int(DEFAULT_CONFIG["graduation_hours"])
 
 
 def _state_path(repo: Path) -> Path:
@@ -456,19 +484,70 @@ def _state_path(repo: Path) -> Path:
 
 
 def _load_state(repo: Path) -> dict:
+    default = {
+        "graduated": False,
+        "healthy_hours": 0.0,
+        "last_healthy_at": None,
+        "last_check": None,
+        "last_result": None,
+        "clean_dates": [],
+    }
     p = _state_path(repo)
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            state = json.loads(p.read_text(encoding="utf-8"))
+            return {**default, **state}
         except Exception:
             pass
-    return {"graduated": False, "clean_dates": [], "last_check": None, "last_result": None}
+    return default
 
 
 def _save_state(repo: Path, state: dict):
     p = _state_path(repo)
     p.parent.mkdir(exist_ok=True)
     p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _infer_stable_hours(repo: Path, now: datetime | None = None) -> tuple[float, str | None]:
+    now = now or datetime.now()
+    log_file = repo / ".git" / "autosync-logs" / "autosync.log"
+    if not log_file.exists():
+        return 0.0, None
+    first_good_after_bad: datetime | None = None
+    last_bad: datetime | None = None
+    with open(log_file, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", line)
+            if not m:
+                continue
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            if "⚠" in line or "✗" in line:
+                last_bad = ts
+                first_good_after_bad = None
+            elif "↑" in line or "↓" in line:
+                if last_bad is None or ts > last_bad:
+                    first_good_after_bad = first_good_after_bad or ts
+    if not first_good_after_bad:
+        return 0.0, None
+    hours = max(0.0, (now - first_good_after_bad).total_seconds() / 3600)
+    return round(hours, 2), first_good_after_bad.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _record_healthy_tick(repo: Path):
+    now = datetime.now()
+    state = _load_state(repo)
+    last = state.get("last_healthy_at")
+    if last:
+        try:
+            delta_h = (now - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+            if 0 < delta_h <= 2.5:
+                state["healthy_hours"] = round(float(state.get("healthy_hours", 0.0)) + delta_h, 2)
+        except ValueError:
+            pass
+    state["last_healthy_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    if float(state.get("healthy_hours", 0.0)) >= GRADUATION_HOURS:
+        state["graduated"] = True
+    _save_state(repo, state)
 
 
 def _check_process(repo: Path) -> tuple[bool, str]:
@@ -627,26 +706,27 @@ def run_check(repo: Path) -> bool:
         if not ok:
             all_ok = False
 
-    # Graduation logic
+    # Graduation logic: cumulative healthy online hours, not calendar days.
     state = _load_state(repo)
-    today = datetime.now().strftime("%Y-%m-%d")
-    if state["graduated"]:
-        grad_msg = "graduated (high-frequency: every 2 min)"
-    else:
-        clean = state.get("clean_dates", [])
-        cutoff = (datetime.now() - timedelta(days=GRADUATION_DAYS + 2)).strftime("%Y-%m-%d")
-        if all_ok:
-            if today not in clean:
-                clean.append(today)
-        else:
-            clean = []
-        clean = sorted(d for d in clean if d >= cutoff)
-        state["clean_dates"] = clean
-        if len(clean) >= GRADUATION_DAYS:
+    if all_ok:
+        inferred_hours, stable_since = _infer_stable_hours(repo)
+        if inferred_hours > float(state.get("healthy_hours", 0.0)):
+            state["healthy_hours"] = inferred_hours
+            if stable_since:
+                state["stable_since"] = stable_since
+        if float(state.get("healthy_hours", 0.0)) >= GRADUATION_HOURS:
             state["graduated"] = True
-            grad_msg = f"🎓 Graduated! {len(clean)} consecutive clean days → 2 min pull"
-        else:
-            grad_msg = f"probation: {len(clean)}/{GRADUATION_DAYS} clean days"
+    else:
+        state["healthy_hours"] = 0.0
+        state["last_healthy_at"] = None
+        state["graduated"] = False
+
+    healthy_hours = float(state.get("healthy_hours", 0.0))
+    if state["graduated"]:
+        grad_msg = f"graduated ({healthy_hours:.1f} healthy hours; 2 min pull, quiet 23:00-05:00)"
+    else:
+        remain = max(0.0, GRADUATION_HOURS - healthy_hours)
+        grad_msg = f"probation: {healthy_hours:.1f}/{GRADUATION_HOURS} healthy hours, {remain:.1f}h remaining"
 
     state["last_check"] = now_str
     state["last_result"] = "healthy" if all_ok else "unhealthy"
@@ -904,7 +984,11 @@ def show_status(repo: Path):
             print(f"  {'✅' if r.returncode == 0 else '❌'} task [{name}]: {status}")
 
     state = _load_state(repo)
-    grad = "graduated (2 min pull)" if state.get("graduated") else f"probation ({len(state.get('clean_dates', []))}/{GRADUATION_DAYS} days)"
+    healthy_hours = float(state.get("healthy_hours", 0.0))
+    if state.get("graduated"):
+        grad = f"graduated ({healthy_hours:.1f} healthy hours; 2 min pull, quiet at night)"
+    else:
+        grad = f"probation ({healthy_hours:.1f}/{GRADUATION_HOURS} healthy hours)"
     print(f"  📊 {grad}")
     if state.get("last_check"):
         print(f"  📅 last check: {state['last_check']} → {state.get('last_result', '?')}")

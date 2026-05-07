@@ -42,11 +42,12 @@ Works with **any** Python installation — python.org, [uv](https://docs.astral.
 File saved → 5s debounce → git add -A → git commit → git push
                           ↑ runs silently in background
 Remote changes → git pull --rebase (every 30 min → 2 min after graduation)
+Night quiet hours → scheduled pulls pause from 23:00 to 05:00
 ```
 
 ### Graduation
 
-The daemon starts in **probation mode** (pulls every 30 minutes). After 5 consecutive days of clean health checks, it **graduates** to high-frequency mode (pulls every 2 minutes). If a check fails, the counter resets.
+The daemon starts in **probation mode** (pulls every 30 minutes). After 24 cumulative healthy online hours, it **graduates** to high-frequency mode (pulls every 2 minutes). Scheduled pulls pause from 23:00 to 05:00; file-save pushes still work if you happen to be working late.
 
 ### Conflict handling
 
@@ -72,6 +73,7 @@ The daemon starts in **probation mode** (pulls every 30 minutes). After 5 consec
 - **Daily at 9:00** — automatic, silent when healthy
 - **Notification only on failure** — Windows balloon tip or macOS notification
 - **Daemon heartbeat** — idle repos stay healthy even when there is nothing new to commit or pull
+- **Cumulative graduation** — counts healthy online hours, not calendar days
 - **Warning file** — `⚠sync-error.md` appears in repo root when unhealthy, disappears when fixed
 - 4 checks: daemon alive, recent sync, local=remote, no pending files
 
@@ -88,7 +90,7 @@ Sync state lives inside `.git/` — no files added to your working tree:
 ├── autosync.log        # sync log
 ├── autosync.pid        # daemon PID
 ├── heartbeat.json      # last successful daemon activity
-└── graduation.json     # graduation state
+└── graduation.json     # healthy hours + graduation state
 ```
 
 > If your Python is PEP 668 restricted (uv, Homebrew), a `.venv/` directory is created next to `sync.py` for the `watchdog` dependency. It's automatically excluded from Git tracking via `.git/info/exclude`.

@@ -262,6 +262,22 @@ class AutoSync:
         d.mkdir(exist_ok=True)
         return d
 
+    def _mark_success(self, desc: str):
+        heartbeat = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "desc": desc,
+        }
+        (self._log_dir() / "heartbeat.json").write_text(
+            json.dumps(heartbeat, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        warning_file = self.repo.path / "⚠sync-error.md"
+        if warning_file.exists():
+            try:
+                warning_file.unlink()
+            except OSError:
+                pass
+
     def _setup_logger(self) -> logging.Logger:
         logger = logging.getLogger(f"autosync-{self.repo.path.name}")
         logger.setLevel(logging.INFO)
@@ -318,6 +334,7 @@ class AutoSync:
                     ok, desc = self.repo.commit_and_push(msg)
                     if ok:
                         self.logger.info(f"↑ {desc}")
+                        self._mark_success(desc)
                     elif "nothing" not in desc:
                         self.logger.warning(f"⚠ push: {desc}")
                         # push rejected → pull immediately and retry
@@ -329,6 +346,7 @@ class AutoSync:
                                 ok2, desc2 = self.repo.commit_and_push(msg)
                                 if ok2:
                                     self.logger.info(f"↑ retry: {desc2}")
+                                    self._mark_success(desc2)
                             except Exception as pe:
                                 self.logger.error(f"✗ pull-retry error: {pe}")
                 except Exception as e:
@@ -343,6 +361,8 @@ class AutoSync:
                     ok, desc = self.repo.pull()
                     if ok:
                         self.logger.info(f"↓ {desc}")
+                    if ok or desc == "up to date":
+                        self._mark_success(desc)
                 except Exception as e:
                     self.logger.error(f"✗ pull error: {e}")
 
@@ -350,9 +370,13 @@ class AutoSync:
         self.logger.info(f"one-time sync: {self.repo.path.name}")
         ok, desc = self.repo.pull()
         self.logger.info(f"↓ {desc}")
+        if ok or desc == "up to date":
+            self._mark_success(desc)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         ok, desc = self.repo.commit_and_push(f"{self.config['commit_message_prefix']}: {stamp}")
         self.logger.info(f"↑ {desc}")
+        if ok:
+            self._mark_success(desc)
 
     def start(self):
         Observer, FileSystemEventHandler, FileSystemEvent = ensure_watchdog()
@@ -394,6 +418,9 @@ class AutoSync:
                 ok, desc = self.repo.commit_and_push(f"{self.config['commit_message_prefix']}: {stamp}")
                 if ok:
                     self.logger.info(f"↑ startup push: {desc}")
+                    self._mark_success(desc)
+                else:
+                    self._mark_success("startup check completed")
         except Exception as e:
             self.logger.warning(f"⚠ startup sync failed: {e}")
 
@@ -472,6 +499,19 @@ def _check_process(repo: Path) -> tuple[bool, str]:
 
 
 def _check_last_sync(repo: Path) -> tuple[bool, str]:
+    heartbeat_file = repo / ".git" / "autosync-logs" / "heartbeat.json"
+    if heartbeat_file.exists():
+        try:
+            heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+            ts = heartbeat.get("time")
+            desc = heartbeat.get("desc") or "daemon heartbeat ok"
+            age_h = (datetime.now() - datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+            if age_h <= 2:
+                return True, f"heartbeat: {ts} ({desc})"
+            return False, f"heartbeat stale: {ts} ({age_h:.1f}h ago)"
+        except Exception:
+            pass
+
     log_file = repo / ".git" / "autosync-logs" / "autosync.log"
     if not log_file.exists():
         return False, "no sync log"

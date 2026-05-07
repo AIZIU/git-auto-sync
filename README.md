@@ -71,6 +71,7 @@ The daemon starts in **probation mode** (pulls every 30 minutes). After 5 consec
 
 - **Daily at 9:00** — automatic, silent when healthy
 - **Notification only on failure** — Windows balloon tip or macOS notification
+- **Daemon heartbeat** — idle repos stay healthy even when there is nothing new to commit or pull
 - **Warning file** — `⚠sync-error.md` appears in repo root when unhealthy, disappears when fixed
 - 4 checks: daemon alive, recent sync, local=remote, no pending files
 
@@ -86,6 +87,7 @@ Sync state lives inside `.git/` — no files added to your working tree:
 .git/autosync-logs/
 ├── autosync.log        # sync log
 ├── autosync.pid        # daemon PID
+├── heartbeat.json      # last successful daemon activity
 └── graduation.json     # graduation state
 ```
 
